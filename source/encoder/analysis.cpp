@@ -36,6 +36,11 @@
 
 using namespace X265_NS;
 
+/* ML split confidence gates: split trusted at 0.5, no-split only near-certain
+ * (a wrong no-split veto costs far more than an extra split trial). */
+#define ML_SPLIT_CONFIDENT_THRESHOLD   0.5f
+#define ML_NOSPLIT_CONFIDENT_THRESHOLD 0.2f
+
 /* An explanation of rate distortion levels (--rd-level)
  *
  * rd-level 0 generates no recon per CU (NO RDO or Quant)
@@ -730,18 +735,18 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
         if (m_param->maxCUSize != 64)
         {
             if (depth == 0 && mightNotSplit && canSplit)
-                mightNotSplit = !(m_MLCTUPred[0] >= 0.5f);
+                mightNotSplit = !(m_MLCTUPred[0] >= ML_SPLIT_CONFIDENT_THRESHOLD);
         }
         else
         {
             if (depth == 0 && mightNotSplit && canSplit)
-                mightNotSplit = !(m_MLCTUPred[0] >= 0.5);
+                mightNotSplit = !(m_MLCTUPred[0] >= ML_SPLIT_CONFIDENT_THRESHOLD);
 
             if (depth == 1 && mightNotSplit && canSplit)
-                mightNotSplit = !(m_MLCTUPred[1 + (cuGeom.absPartIdx / 64)] >= 0.5);
+                mightNotSplit = !(m_MLCTUPred[1 + (cuGeom.absPartIdx / 64)] >= ML_SPLIT_CONFIDENT_THRESHOLD);
 
             if (depth == 2 && mightNotSplit && canSplit)
-                mightNotSplit = !(m_MLCTUPred[5 + (cuGeom.absPartIdx / 16)] >= 0.5);
+                mightNotSplit = !(m_MLCTUPred[5 + (cuGeom.absPartIdx / 16)] >= ML_SPLIT_CONFIDENT_THRESHOLD);
         }
     }
 #endif
@@ -924,14 +929,23 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
 #if ENABLE_MLCTUPRED
     if (m_MLCTUPred)
     {
+        /* Forces split when confident; vetoes it only when near-certain no-split. */
         bool mandatorySplit = (cuGeom.flags & CUGeom::SPLIT_MANDATORY);
         bool canSplit = !(cuGeom.flags & CUGeom::LEAF);
+
+        auto gateSplit = [&](float pred, bool canVeto, float vetoThreshold = ML_NOSPLIT_CONFIDENT_THRESHOLD)
+        {
+            if (mandatorySplit || pred >= ML_SPLIT_CONFIDENT_THRESHOLD)
+                mightSplit = true;
+            else if (canVeto && pred <= vetoThreshold)
+                mightSplit = false;
+            mightSplit &= canSplit;
+        };
 
         if (m_param->maxCUSize != 64)
         {
             if (depth == 0)
-                mightSplit =
-                    ((m_MLCTUPred[0] >= 0.5f) || mandatorySplit) && canSplit;
+                gateSplit(m_MLCTUPred[0], true);
         }
         else
         {
@@ -940,13 +954,14 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
             bool canStopSplit = mightNotSplit && (m_param->bEnableIntra64x64 || cuGeom.log2CUSize != MAX_LOG2_CU_SIZE);
 
             if (depth == 0)
-                mightSplit = (m_MLCTUPred[0] >= 0.5 || mandatorySplit || !canStopSplit) && canSplit;
+                gateSplit(m_MLCTUPred[0], canStopSplit);
 
             else if (depth == 1)
-                mightSplit = (m_MLCTUPred[1 + (cuGeom.absPartIdx / 64)] >= 0.5 || mandatorySplit) && canSplit;
+                gateSplit(m_MLCTUPred[1 + (cuGeom.absPartIdx / 64)], true);
 
+            // level16 tolerates a smaller dead zone than level64/32 (full trust hurt quality).
             else if (depth == 2)
-                mightSplit = (m_MLCTUPred[5 + (cuGeom.absPartIdx / 16)] >= 0.5 || mandatorySplit) && canSplit;
+                gateSplit(m_MLCTUPred[5 + (cuGeom.absPartIdx / 16)], true, 0.35f);
         }
     }
 #endif

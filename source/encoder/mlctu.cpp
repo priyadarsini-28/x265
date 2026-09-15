@@ -57,6 +57,7 @@ static int mlSessionForQP(int qp)
         return 1;
     return 2;
 }
+
 /* Raster-to-Z-scan for the 16 4x4 sub-blocks within a 16x16 block */
 static const uint8_t rasterToZ16[16] =
 {
@@ -610,7 +611,6 @@ void MLCTUPredictor::run_model(CTUPartitionInference* ctu, MLCTUBuffers& buffers
 
 void MLCTUPredictor::process_output(const float* level_1, const float* level_2, const float* level_3, float* output, int ctuOffset, int batchCount)
 {
-
     int maxCUsize = m_param->maxCUSize;
 
     if (maxCUsize == 32)
@@ -641,10 +641,9 @@ void MLCTUPredictor::process_output(const float* level_1, const float* level_2, 
             {
                 float* dst = output + addrs[q];
 
-                // 32→16 split decision (from level_2)
-                bool split32 = level_2[localVn * 4 + q] >= 0.5f;
-                dst[0] = split32 ? 1.0f : 0.0f;
-
+                // 32→16 split probability (from level_2); analysis.cpp applies
+                // the split-confident and no-split-confident thresholds.
+                dst[0] = level_2[localVn * 4 + q];
             }
         }
     }
@@ -655,14 +654,13 @@ void MLCTUPredictor::process_output(const float* level_1, const float* level_2, 
             int n = ctuOffset + localN;
             float* dst = output + 21 * n;
 
-            bool split64 = level_1[localN] >= 0.5f;
-            dst[0] = split64 ? 1.0f : 0.0f;
+            // Store raw split probabilities; analysis.cpp applies the
+            // split-confident and no-split-confident thresholds.
+            dst[0] = level_1[localN];
 
             for (int i = 0; i < 4; i++)
             {
-                bool split32 = level_2[localN * 4 + i] >= 0.5f;
-
-                dst[1 + i] = split32 ? 1.0f : 0.0f;
+                dst[1 + i] = level_2[localN * 4 + i];
 
                 for (int j = 0; j < 4; j++)
                 {
@@ -671,9 +669,7 @@ void MLCTUPredictor::process_output(const float* level_1, const float* level_2, 
                     int childIdx = row * 4 + col;
                     int z = rasterToZ16[childIdx];
 
-                    bool split16 = level_3[localN * 16 + childIdx] >= 0.5f;
-
-                    dst[5 + z] = split16 ? 1.0f : 0.0f;
+                    dst[5 + z] = level_3[localN * 16 + childIdx];
                 }
             }
         }
