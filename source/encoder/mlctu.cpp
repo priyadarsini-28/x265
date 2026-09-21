@@ -615,11 +615,12 @@ void MLCTUPredictor::process_output(const float* level_1, const float* level_2, 
 
     if (maxCUsize == 32)
     {
-        // Actual CTU dimensions (since maxCUsize=32)
-        const int ctuWidth = (m_param->sourceWidth) / 32;
+        // Ceiling-divide to match frame.cpp's m_MLCTUPred allocation
+        const int ctuWidth  = (m_param->sourceWidth  + 31) / 32;
+        const int ctuHeight = (m_param->sourceHeight + 31) / 32;
 
-        // Virtual CTU dimensions (half of actual)
-        const int vCtuWidth = ctuWidth / 2;
+        // Virtual CTU dimensions (half of actual, rounded up)
+        const int vCtuWidth = (ctuWidth + 1) / 2;
 
         for (int localVn = 0; localVn < batchCount; localVn++)
         {
@@ -630,20 +631,23 @@ void MLCTUPredictor::process_output(const float* level_1, const float* level_2, 
             int vcol = vn % vCtuWidth;
 
             // ===== CALCULATE 4 ACTUAL CTU ADDRESSES (raster order) =====
-            // Virtual CTU (vrow, vcol) maps to 4 actual CTUs:
-            int addr_Q0 = (2*vrow + 0) * ctuWidth + (2*vcol + 0);  // TL
-            int addr_Q1 = (2*vrow + 0) * ctuWidth + (2*vcol + 1);  // TR
-            int addr_Q2 = (2*vrow + 1) * ctuWidth + (2*vcol + 0);  // BL
-            int addr_Q3 = (2*vrow + 1) * ctuWidth + (2*vcol + 1);  // BR
-            int addrs[4] = {addr_Q0, addr_Q1, addr_Q2, addr_Q3};
-            // ===== WRITE TO ALL 4 ACTUAL CTU POSITIONS =====
-            for (int q = 0; q < 4; q++)
+            int rows[2] = {2*vrow, 2*vrow + 1};
+            int cols[2] = {2*vcol, 2*vcol + 1};
+            // ===== WRITE TO ALL 4 ACTUAL CTU POSITIONS, SKIPPING OUT-OF-GRID QUADRANTS =====
+            for (int r = 0; r < 2; r++)
             {
-                float* dst = output + addrs[q];
+                if (rows[r] >= ctuHeight)
+                    continue;
+                for (int c = 0; c < 2; c++)
+                {
+                    if (cols[c] >= ctuWidth)
+                        continue;
+                    int q = r * 2 + c;
+                    float* dst = output + rows[r] * ctuWidth + cols[c];
 
-                // 32→16 split probability (from level_2); analysis.cpp applies
-                // the split-confident and no-split-confident thresholds.
-                dst[0] = level_2[localVn * 4 + q];
+                    // 32→16 split probability; analysis.cpp applies the thresholds
+                    dst[0] = level_2[localVn * 4 + q];
+                }
             }
         }
     }
