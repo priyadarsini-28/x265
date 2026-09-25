@@ -555,8 +555,7 @@ void Encoder::create()
             for (int ni = 0; ni < numNodes; ni++)
                 mlNodeMask |= ((uint64_t)1 << ni);
 
-            /* ML pool width = concurrent frame inferences; each is further sized
-             * by intra-op threads in mlctu.cpp. */
+            /* One worker per concurrent frame inference */
             const int mlThreads = X265_MIN(m_param->frameNumThreads, MAX_POOL_THREADS);
             m_mlThreadPool = new ThreadPool();
             if (!m_mlThreadPool->create(mlThreads, 1, mlNodeMask))
@@ -573,7 +572,7 @@ void Encoder::create()
                 m_MLCTUPredictor->m_jpId = m_mlThreadPool->m_numProviders++;
                 m_mlThreadPool->m_jpTable[m_MLCTUPredictor->m_jpId] = m_MLCTUPredictor;
                 m_mlThreadPool->start();
-                x265_log(m_param, X265_LOG_INFO,
+                x265_log(m_param, X265_LOG_DEBUG,
                          "ML CTU pred: async thread pool started (%d threads)\n",
                          mlThreads);
             }
@@ -2420,8 +2419,8 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             /* Initiate reconfigure for this FE if necessary */
             curEncoder->m_param = m_reconfigure ? m_latestParam : m_param;
             curEncoder->m_reconfigure = m_reconfigure;
-            /* give this frame a FrameData instance before encoding */
 
+            /* give this frame a FrameData instance before encoding */
             for (int layer = 0; layer < m_param->numLayers; layer++)
             {
                 if (m_dpb->m_frameDataFreeList)
@@ -2641,8 +2640,6 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
                     }
                 }
             }
-
-
 
             /* Allow FrameEncoder::compressFrame() to start in the frame encoder thread */
             if (!curEncoder->startCompressFrame(frameEnc))
@@ -3325,19 +3322,19 @@ void Encoder::finishFrameStats(Frame* curFrame, FrameEncoder *curEncoder, x265_f
                     frameStats->list1POC[ref] = ref < slice->m_numRefIdx[1] ? slice->m_refPOCList[1][ref] - slice->m_lastIDR : -1;
             }
         }
-        #define ELAPSED_MSEC(start, end) (((double)(end) - (start)) / 1000)
-        frameStats->decideWaitTime = ELAPSED_MSEC(0, curEncoder->m_slicetypeWaitTime[layer]);
+#define ELAPSED_MSEC(start, end) (((double)(end) - (start)) / 1000)
+        if (m_param->csvLogLevel >= 2)
+        {
+#if ENABLE_LIBVMAF
+            frameStats->vmafFrameScore = curFrame->m_fencPic->m_vmafScore;
+#endif
+            frameStats->decideWaitTime = ELAPSED_MSEC(0, curEncoder->m_slicetypeWaitTime[layer]);
             frameStats->row0WaitTime = ELAPSED_MSEC(curEncoder->m_startCompressTime[layer], curEncoder->m_row0WaitTime[layer]);
             frameStats->wallTime = ELAPSED_MSEC(curEncoder->m_row0WaitTime[layer], curEncoder->m_endCompressTime[layer]);
             frameStats->refWaitWallTime = ELAPSED_MSEC(curEncoder->m_row0WaitTime[layer], curEncoder->m_allRowsAvailableTime[layer]);
             frameStats->totalCTUTime = ELAPSED_MSEC(0, curEncoder->m_totalWorkerElapsedTime[layer]);
             frameStats->stallTime = ELAPSED_MSEC(0, curEncoder->m_totalNoWorkerTime[layer]);
             frameStats->totalFrameTime = ELAPSED_MSEC(curFrame->m_encodeStartTime, x265_mdate());
-        if (m_param->csvLogLevel >= 2)
-        {
-#if ENABLE_LIBVMAF
-            frameStats->vmafFrameScore = curFrame->m_fencPic->m_vmafScore;
-#endif
 
             frameStats->tmeTime = curEncoder->m_totalThreadedMETime[layer];
             frameStats->tmeWaitTime = curEncoder->m_totalThreadedMEWait[layer];
@@ -4054,6 +4051,25 @@ void Encoder::configure(x265_param *p)
     {
         p->minCUSize = 8;
         x265_log(p, X265_LOG_WARNING, "Setting minCuSize = 8, AVCINFO expects 8x8 blocks\n");
+    }
+
+    if (p->bEnableMLCTUPred)
+    {
+#ifdef ENABLE_MLCTUPRED
+        if (p->maxCUSize != 64 && p->maxCUSize != 32)
+        {
+            x265_log(p, X265_LOG_WARNING, "ML CTU pred requires --ctu 64 or 32, disabling ml-ctu-pred\n");
+            p->bEnableMLCTUPred = 0;
+        }
+        else if (p->numLayers > 1)
+        {
+            x265_log(p, X265_LOG_WARNING, "ML CTU pred does not support multi-layer encodes, disabling ml-ctu-pred\n");
+            p->bEnableMLCTUPred = 0;
+        }
+#else
+        x265_log(p, X265_LOG_WARNING, "x265 built without ENABLE_MLCTUPRED, disabling ml-ctu-pred\n");
+        p->bEnableMLCTUPred = 0;
+#endif
     }
 
     if (p->keyframeMax < 0)

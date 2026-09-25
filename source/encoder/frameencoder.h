@@ -277,9 +277,9 @@ public:
     int                      m_sLayerId;
 
 #ifdef ENABLE_MLCTUPRED
-    MLCTUBuffers             m_mlBuffers;   /* per-FrameEncoder pre-allocated inference buffers */
-    MLPredictionRequest      m_mlRequest;   /* request object re-used each I-frame */
-    ThreadSafeInteger        m_mlRowsReady; /* CTU rows whose ML prediction is ready, for WPP */
+    MLCTUBuffers             m_mlBuffers;   /* ML model inputs */
+    MLPredictionRequest      m_mlRequest;   /* reused for each I-frame */
+    ThreadSafeInteger        m_mlRowsReady; /* CTU rows with ML predictions ready */
 #endif
 
     std::queue<CTUTask>      m_tmeTasks;

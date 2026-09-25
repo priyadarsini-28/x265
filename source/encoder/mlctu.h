@@ -22,89 +22,80 @@
 #ifdef ENABLE_MLCTUPRED
 
 #include "common.h"
-#include <onnxruntime_cxx_api.h>
+#include "threading.h"
 #include "threadpool.h"
+#if defined(__MINGW32__)
+#include <specstrings.h>
+#ifndef _Frees_ptr_opt_
+#define _Frees_ptr_opt_ /* SAL annotation missing from MinGW, used by ONNX Runtime */
+#endif
+#endif
+#include <onnxruntime_c_api.h>
 #include <queue>
 
-/* Per-CTU prediction layout (64x64 CTU, 3 levels):
- *   index 0       : split 64x64 into 32x32? (1 value)
- *   index 1..4    : split each 32x32 into 16x16? (4 values, Z-scan quadrant order)
- *   index 5..20   : split each 16x16 into 8x8?  (16 values, Z-scan order)
- */
+/* Model block size, independent of maxCUSize */
+#define ML_BLOCK_SIZE  64
+
+/* Split probabilities per 64x64 CTU, Z-scan order:
+ *   [0]     64x64 -> 32x32
+ *   [1..4]  32x32 -> 16x16
+ *   [5..20] 16x16 -> 8x8
+ * A 32x32 CTU holds one value, 32x32 -> 16x16. */
 #define CTU_PRED_SIZE  21
-#define NUM_MODELS 3
-/* Cap on intra-op/preprocessing threads per inference; benchmarked sweet spot
- * on many-core boxes. Effective width is derived in mlIntraOpThreads(). */
+#define NUM_MODELS     3
+
+/* At or above the split threshold the split is forced, at or below a no-split
+ * threshold it is skipped, in between RD decides. No-split is gated tighter
+ * since a wrong veto costs more than an extra split trial. */
+#define ML_SPLIT_CONFIDENT_THRESHOLD      0.5f
+#define ML_NOSPLIT_CONFIDENT_THRESHOLD    0.2f
+#define ML_NOSPLIT_CONFIDENT_THRESHOLD_16 0.35f
+
+/* Written on inference failure; between all thresholds, so RD decides */
+#define ML_PRED_NEUTRAL ((ML_SPLIT_CONFIDENT_THRESHOLD + ML_NOSPLIT_CONFIDENT_THRESHOLD_16) / 2)
+
+/* Max intra-op and preprocessing threads per inference */
 #define ML_MAX_INTRAOP_THREADS 8
 
-/* Number of 64x64-block rows batched per ort->Run() call in
- * predictPreparedPartitionsChunked() */
-#ifndef ML_ROW_CHUNK_SIZE
+/* 64x64 block rows per inference call */
 #define ML_ROW_CHUNK_SIZE 1
-#endif
 
-/* Per-frame std::chrono + printf profiling of preprocess/inference/post stages.
- * MUST stay 0 for production builds; set to 1 only when profiling. */
-#ifndef PROFILE_ML
-#define PROFILE_ML 0
-#endif
+/* Minimum ONNX Runtime C API version */
+#define ML_ORT_API_VERSION 17
 
-#ifndef USE_QUANTIZED_MODEL
-#define USE_QUANTIZED_MODEL 1
-#endif
+namespace X265_NS {
+// private x265 namespace
 
-#ifndef ENABLE_ORT_PROFILE
-#define ENABLE_ORT_PROFILE 0
-#endif
-
-#if PROFILE_ML
-#include <chrono>
-#endif
-
-namespace X265_NS
-{
-
-typedef struct {
-    const OrtApi* ort;           // ONNX Runtime API
-    OrtEnv* env;                 // ONNX Runtime environment
-    OrtSession* session;         // ONNX Runtime session
-    OrtSessionOptions* session_options; // Session options
-    OrtMemoryInfo* memory_info;  // Memory info for tensors
-} CTUPartitionInference;
-
+/* Model inputs, one entry per 64x64 block */
 struct MLCTUBuffers
 {
-    float* b1;
-    float* b2;
-    float* b3;
-    float* qp_buffer;
+    float* qp;   // [numBlocks]            normalized QP
+    float* b1;   // [numBlocks][16][16]    4x4 means minus 64x64 mean
+    float* b2;   // [numBlocks][32][32]    2x2 means minus 32x32 mean
+    float* b3;   // [numBlocks][64][64]    pixels minus 16x16 mean
 
-    MLCTUBuffers()
+    MLCTUBuffers() : qp(NULL), b1(NULL), b2(NULL), b3(NULL) {}
+    ~MLCTUBuffers() { destroy(); }
+
+    bool init(int numBlocks)
     {
-        b1 = NULL;
-        b2 = NULL;
-        b3 = NULL;
-        qp_buffer = NULL;
+        qp = X265_MALLOC(float, numBlocks);
+        b1 = X265_MALLOC(float, numBlocks * 16 * 16);
+        b2 = X265_MALLOC(float, numBlocks * 32 * 32);
+        b3 = X265_MALLOC(float, numBlocks * 64 * 64);
+        if (!isAllocated())
+        {
+            destroy();
+            return false;
+        }
+        return true;
     }
 
-    ~MLCTUBuffers()
-    {
-        destroy();
-    }
-
-    bool init(int totalCTUs, int /*maxCUSize*/)
-    {
-        qp_buffer = X265_MALLOC(float, totalCTUs);
-        b1 = X265_MALLOC(float, totalCTUs * 256);
-        b2 = X265_MALLOC(float, totalCTUs * 1024);
-        b3 = X265_MALLOC(float, totalCTUs * 4096);
-
-        return qp_buffer && b1 && b2 && b3;
-    }
+    bool isAllocated() const { return qp && b1 && b2 && b3; }
 
     void destroy()
     {
-        X265_FREE(qp_buffer); qp_buffer = NULL;
+        X265_FREE(qp); qp = NULL;
         X265_FREE(b1); b1 = NULL;
         X265_FREE(b2); b2 = NULL;
         X265_FREE(b3); b3 = NULL;
@@ -120,20 +111,20 @@ enum MLPredictionRequestType
 
 struct MLPredictionRequest
 {
-    pixel* plane;
-    intptr_t stride;
-    int qp;
-    const double* cuTreeOffsets;
-    uint32_t qgSize;
-    float* output;
-    MLCTUBuffers* buffers;
+    pixel*             plane;
+    intptr_t           stride;
+    int                qp;
+    const double*      cuTreeOffsets;
+    uint32_t           qgSize;
+    float*             output;
+    MLCTUBuffers*      buffers;
     MLPredictionRequestType type;
-    bool preprocessQueued;
-    Event preprocessDone;
-    Event done;
+    bool               preprocessQueued;
+    Event              preprocessDone;
+    Event              done;
 
-    ThreadSafeInteger* rowsReady;
-    int numActualRows;
+    ThreadSafeInteger* rowsReady;     // CTU rows with predictions ready
+    int                numActualRows;
 
     MLPredictionRequest()
         : plane(NULL)
@@ -153,44 +144,51 @@ struct MLPredictionRequest
 class MLCTUPredictor : public JobProvider
 {
 public:
-    x265_param* m_param;
-    int maxCUSize;
-    int totalCTUs;
-    /* ML thread budget (sized to core count in init()): ONNX intra-op threads
-     * per session, and OMP threads for preprocessing. */
-    int m_intraOpThreads;
-    int m_prepThreads;
-    OrtEnv*           m_env;
-    CTUPartitionInference* m_sessions[NUM_MODELS];
-
-    // Threading / queue variables
-    std::queue<MLPredictionRequest*> m_requestQueue;
-    Lock                             m_queueLock;
 
     explicit MLCTUPredictor(x265_param* param);
     ~MLCTUPredictor();
+
     bool init();
-    CTUPartitionInference* init_ctu_onnx(const char*);
-    void preprocessInput(pixel* plane, intptr_t stride, MLCTUBuffers& buffers);
-    void fillQpBuffer(int QP, const double* cuTreeOffsets, uint32_t qgSize, MLCTUBuffers& buffers);
-    void run_model(CTUPartitionInference* ctu, MLCTUBuffers& buffers, float* output, int ctuOffset, int batchCount);
-    void process_output(const float* level_1, const float* level_2, const float* level_3, float* output, int ctuOffset, int batchCount);
-    void predictPreparedPartitions(int QP, const double* cuTreeOffsets, uint32_t qgSize, float* output, MLCTUBuffers& buffers);
-    void predictPartitions(pixel* plane, intptr_t stride, int QP, const double* cuTreeOffsets, uint32_t qgSize, float* output, MLCTUBuffers& buffers);
-    void predictPreparedPartitionsChunked(int QP, const double* cuTreeOffsets, uint32_t qgSize, float* output,
-                                          MLCTUBuffers& buffers, ThreadSafeInteger* rowsReady, int numActualRows);
-    void cleanup_ctu_onnx();
 
-    // JobProvider virtual method
-    void findJob(int workerThreadId);
-
-    // Add request and trigger prediction
+    /* Run on m_pool, or synchronously without one. enqueuePreprocessRequest()
+     * returns false if there is no pool. */
     bool enqueuePreprocessRequest(MLPredictionRequest* req);
     void enqueuePreparedRequest(MLPredictionRequest* req);
     void enqueueRequest(MLPredictionRequest* req);
-};
 
-} // namespace X265_NS
+    void findJob(int workerThreadId);
+
+protected:
+
+    x265_param*       m_param;
+    int               m_numBlocksW;
+    int               m_numBlocksH;
+    int               m_numBlocks;
+    int               m_intraOpThreads;   // ONNX intra-op threads per inference
+    int               m_prepThreads;      // OpenMP threads for preprocessing
+
+    const OrtApi*     m_ort;
+    OrtEnv*           m_env;
+    OrtMemoryInfo*    m_memoryInfo;
+    OrtSession*       m_sessions[NUM_MODELS];
+
+    std::queue<MLPredictionRequest*> m_requestQueue;
+    Lock              m_queueLock;
+
+    bool resolveModelDir(char* dir, size_t size) const;
+    OrtSession* loadModel(const char* path);
+    bool checkStatus(OrtStatus* status, const char* what, int level = X265_LOG_ERROR) const;
+    void release();
+
+    void preprocessInput(const pixel* plane, intptr_t stride, MLCTUBuffers& buffers);
+    void fillQpBuffer(int qp, const double* cuTreeOffsets, uint32_t qgSize, MLCTUBuffers& buffers);
+    void runModel(OrtSession* session, MLCTUBuffers& buffers, float* output, int blockOffset, int batchCount);
+    void processOutput(const float* level1, const float* level2, const float* level3, float* output, int blockOffset, int batchCount);
+    void predictPreparedPartitionsChunked(int qp, const double* cuTreeOffsets, uint32_t qgSize, float* output,
+                                          MLCTUBuffers& buffers, ThreadSafeInteger* rowsReady, int numActualRows);
+    void enqueue(MLPredictionRequest* req);
+};
+}
 
 #endif // ENABLE_MLCTUPRED
-#endif // X265_MLCTU_H
+#endif // ifndef X265_MLCTU_H

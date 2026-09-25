@@ -412,6 +412,7 @@ static const struct option long_options[] =
     { "fovea-gaze-file", required_argument, NULL, 0 },
     { "ml-ctu-pred",          no_argument, NULL, 0 },
     { "no-ml-ctu-pred",       no_argument, NULL, 0 },
+    { "ml-model-dir",   required_argument, NULL, 0 },
     { 0, 0, 0, 0 }
 };
 

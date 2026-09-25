@@ -401,6 +401,7 @@ void x265_param_default(x265_param* param)
 
     /* ML CTU partition prediction */
     param->bEnableMLCTUPred = 0;
+    param->mlModelDir[0] = 0;
     param->bEnableIntra64x64 = 0;
 
     /* DCT Approximations */
@@ -1572,8 +1573,8 @@ int x265_param_parse(x265_param* p, const char* name, const char* value)
         OPT("fovea-sigma") p->foveaSigma = (float)atof(value);
         OPT("fovea-gaze-file") p->foveaGazeFile = strdup(value);
         OPT("ml-ctu-pred") p->bEnableMLCTUPred = atobool(value);
+        OPT("ml-model-dir") snprintf(p->mlModelDir, X265_MAX_STRING_SIZE, "%s", value);
         OPT("intra-64x64") p->bEnableIntra64x64 = atobool(value);
-
         else
             return X265_PARAM_BAD_NAME;
     }
@@ -2413,6 +2414,7 @@ char *x265_param2string(x265_param* p, int padx, int pady)
     BOOL(p->bCULossless, "cu-lossless");
     BOOL(p->bIntraInBFrames, "b-intra");
     BOOL(p->bEnableIntra64x64, "intra-64x64");
+    BOOL(p->bEnableMLCTUPred, "ml-ctu-pred");
     BOOL(p->bEnableSplitRdSkip, "splitrd-skip");
     s += snprintf(s, bufSize - (s - buf), " rdpenalty=%d", p->rdPenalty);
     s += snprintf(s, bufSize - (s - buf), " psy-rd=%.2f", p->psyRd);
@@ -3052,6 +3054,7 @@ void x265_copy_params(x265_param* dst, x265_param* src)
     dst->vbvEndFrameAdjust = src->vbvEndFrameAdjust;
     dst->bAnalysisType = src->bAnalysisType;
     dst->bEnableMLCTUPred = src->bEnableMLCTUPred;
+    snprintf(dst->mlModelDir, X265_MAX_STRING_SIZE, "%s", src->mlModelDir);
     dst->bEnableIntra64x64 = src->bEnableIntra64x64;
     dst->bCopyPicToFrame = src->bCopyPicToFrame;
     if (strlen(src->analysisSave)) snprintf(dst->analysisSave, X265_MAX_STRING_SIZE, "%s", src->analysisSave);

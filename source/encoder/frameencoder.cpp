@@ -45,8 +45,7 @@ namespace X265_NS {
 void weightAnalyse(Slice& slice, Frame& frame, x265_param& param);
 
 #ifdef ENABLE_MLCTUPRED
-/* ML CTU partition prediction runs only on I-frames and only when the
- * predictor and per-frame output buffer are both available. */
+/* ML prediction runs on I-frames only */
 static inline bool shouldRunMLPred(const Encoder* top, const Frame* frame)
 {
     return top->m_MLCTUPredictor &&
@@ -229,19 +228,10 @@ bool FrameEncoder::init(Encoder *top, int numRows, int numCols)
 #ifdef ENABLE_MLCTUPRED
     if (m_param->bEnableMLCTUPred)
     {
-        const int numCTUsW = (m_param->sourceWidth  + 63) / 64;
-        const int numCTUsH = (m_param->sourceHeight + 63) / 64;
-        const int totalCTUs = numCTUsW * numCTUsH;
-        if (!m_mlBuffers.init(totalCTUs,m_param->maxCUSize))
-        {
-            x265_log(m_param, X265_LOG_WARNING,
-                     "ML CTU pred: buffer alloc failed for frame encoder\n");
-            m_param->bEnableMLCTUPred = 0;
-        }
-        else
-        {
-            m_mlRequest.buffers = &m_mlBuffers;
-        }
+        const int numBlocksW = (m_param->sourceWidth  + ML_BLOCK_SIZE - 1) / ML_BLOCK_SIZE;
+        const int numBlocksH = (m_param->sourceHeight + ML_BLOCK_SIZE - 1) / ML_BLOCK_SIZE;
+        ok &= m_mlBuffers.init(numBlocksW * numBlocksH);
+        m_mlRequest.buffers = &m_mlBuffers;
     }
 #endif
 
@@ -329,7 +319,7 @@ bool FrameEncoder::startCompressFrame(Frame* curFrame[MAX_LAYERS])
         m_mlRequest.plane  = curFrame[0]->m_fencPic->m_picOrg[0];
         m_mlRequest.stride = curFrame[0]->m_fencPic->m_stride;
         m_mlRequest.output = curFrame[0]->m_MLCTUPred;
-        m_mlRequest.buffers = &m_mlBuffers;
+        /* Overlap preprocessing with rate control; inference needs the QP */
         m_mlRequest.preprocessQueued = m_top->m_MLCTUPredictor->enqueuePreprocessRequest(&m_mlRequest);
     }
     else
@@ -652,53 +642,29 @@ void FrameEncoder::compressFrame(int layer)
     m_rce.newQp = qp;
 
 #ifdef ENABLE_MLCTUPRED
-    if (layer == 0)
+    if (layer == 0 && shouldRunMLPred(m_top, m_frame[0]))
     {
-        if (shouldRunMLPred(m_top, m_frame[0]))
+        /* plane, stride and output are set in startCompressFrame() */
+        const bool preprocessed = m_mlRequest.preprocessQueued;
+        if (preprocessed)
         {
-            bool preprocessed = false;
-            if (m_mlRequest.preprocessQueued)
-            {
-#if PROFILE_ML
-                auto t_wait0 = std::chrono::high_resolution_clock::now();
-#endif
-                m_mlRequest.preprocessDone.wait();
-#if PROFILE_ML
-                auto t_wait1 = std::chrono::high_resolution_clock::now();
-                double wait_ms = std::chrono::duration<double, std::milli>(t_wait1 - t_wait0).count();
-                static int waitCount = 0;
-                static double totalWait = 0.0;
-                waitCount++;
-                totalWait += wait_ms;
-                printf("ML CTU preprocess wait frame %d: wait=%.2f ms (avg %.2f)\n",
-                       waitCount, wait_ms, totalWait / waitCount);
-#endif
-                m_mlRequest.preprocessQueued = false;
-                preprocessed = true;
-            }
-            else
-            {
-                m_mlRequest.plane  = m_frame[0]->m_fencPic->m_picOrg[0];
-                m_mlRequest.stride = m_frame[0]->m_fencPic->m_stride;
-                m_mlRequest.output = m_frame[0]->m_MLCTUPred;
-                m_mlRequest.buffers = &m_mlBuffers;
-            }
-
-            m_mlRequest.qp = qp;
-            m_mlRequest.cuTreeOffsets = m_frame[0]->m_lowres.qpCuTreeOffset;
-            m_mlRequest.qgSize = (m_param->rc.qgSize == 8) ? 8 : 16;
-            m_mlRequest.rowsReady = &m_mlRowsReady;
-            m_mlRequest.numActualRows = (int)m_numRows;
-            m_mlRowsReady.set(0);
-            m_mlRequest.done.reset();
-            if (preprocessed)
-                m_top->m_MLCTUPredictor->enqueuePreparedRequest(&m_mlRequest);
-            else
-                m_top->m_MLCTUPredictor->enqueueRequest(&m_mlRequest);
+            m_mlRequest.preprocessDone.wait();
+            m_mlRequest.preprocessQueued = false;
         }
+
+        m_mlRequest.qp = qp;
+        m_mlRequest.cuTreeOffsets = m_frame[0]->m_lowres.qpCuTreeOffset;
+        m_mlRequest.qgSize = (m_param->rc.qgSize == 8) ? 8 : 16;
+        m_mlRequest.rowsReady = &m_mlRowsReady;
+        m_mlRequest.numActualRows = (int)m_numRows;
+        m_mlRowsReady.set(0);
+        m_mlRequest.done.reset();
+        if (preprocessed)
+            m_top->m_MLCTUPredictor->enqueuePreparedRequest(&m_mlRequest);
+        else
+            m_top->m_MLCTUPredictor->enqueueRequest(&m_mlRequest);
     }
 #endif
-
 
     if (!!layer && m_top->m_lookahead->m_bAdaptiveQuant)
     {
@@ -1016,7 +982,6 @@ void FrameEncoder::compressFrame(int layer)
 
     if (m_param->bDynamicRefine)
         computeAvgTrainingData(layer);
-
 
     /* Analyze CTU rows, most of the hard work is done here.  Frame is
      * compressed in a wave-front pattern if WPP is enabled. Row based loop
@@ -1659,7 +1624,7 @@ void FrameEncoder::processRowEncoder(int intRow, ThreadLocalData& tld, int layer
              * believe the problem is fixed, but are leaving this check in place
              * to prevent crashes in case it is not */
             x265_log(m_param, X265_LOG_WARNING,
-                    "internal error - simultaneous row access detected. Please report HW to x265-devel@videolan.org\n");
+                     "internal error - simultaneous row access detected. Please report HW to x265-devel@videolan.org\n");
             return;
         }
         curRow.busy = true;

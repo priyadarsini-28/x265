@@ -149,8 +149,8 @@ public:
     void computeMVForPUs(CUData& ctu, const CUGeom& cuGeom, int qp, Frame& frame);
 
 protected:
-#if ENABLE_MLCTUPRED
-    // Points into frame->m_MLCTUPred at this CTU's offset; see frame.h for layout.
+#ifdef ENABLE_MLCTUPRED
+    /* this CTU's entry in Frame::m_MLCTUPred */
     const float*               m_MLCTUPred;
 #endif
 

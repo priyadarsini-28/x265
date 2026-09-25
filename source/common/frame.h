@@ -182,8 +182,9 @@ public:
     /* target QP for this picture.*/
     int                    m_targetQp;
 
-    // ML CTU split predictions, float[numCTUs * 21]: [n*21+0]=split64,
-    // [n*21+1..4]=split32 quadrants, [n*21+5..20]=split16 (Z-scan). NULL if disabled.
+    /* ML CTU split probabilities, NULL if disabled. With 64x64 CTUs, float[numCTUs * 21]:
+     * [n*21+0]=split64, [n*21+1..4]=split32 quadrants, [n*21+5..20]=split16 (Z-scan).
+     * With 32x32 CTUs, float[numCTUs]: split32 per CTU. */
     float*                 m_MLCTUPred;
 
     Frame();
