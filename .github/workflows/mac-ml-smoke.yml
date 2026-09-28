@@ -82,7 +82,7 @@ jobs:
           cmake ../../source -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_MLCTUPRED=ON -DONNXRUNTIME_DIR="$ORT_DIR" \
             -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
-            "${OMP_ARGS[@]}" 2>&1 | tee cfg.log
+            ${OMP_ARGS[@]+"${OMP_ARGS[@]}"} 2>&1 | tee cfg.log
           grep -E "ML CTU|Library:|OpenMP" cfg.log || true
           make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee build.log
           echo "=== Warnings in ML sources ==="
