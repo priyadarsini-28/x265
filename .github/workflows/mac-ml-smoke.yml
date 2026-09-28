@@ -1,0 +1,171 @@
+# TEMPORARY: macOS build + smoke test for --ml-ctu-pred. Not for merge.
+name: macOS ML smoke
+
+on:
+  push:
+    branches: [mac-ml-smoke]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ORT_VERSION: "1.20.1"
+
+jobs:
+  smoke:
+    name: "macOS ${{ matrix.runner }} (${{ matrix.omp }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest]
+        # apple-clang: no OpenMP (Apple clang default); libomp: Homebrew OpenMP
+        omp: [apple-clang, libomp]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          brew untap aws/tap || true
+          if [[ "${{ matrix.omp }}" == libomp ]]; then brew install libomp; fi
+          clang --version
+          cmake --version | head -1
+
+      - name: Download ONNX Runtime
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64)  ORT_ARCH=arm64 ;;
+            x86_64) ORT_ARCH=x86_64 ;;
+          esac
+          ORT_NAME=onnxruntime-osx-${ORT_ARCH}-${ORT_VERSION}
+          curl -fsSL --retry 5 -o ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_NAME}.tgz"
+          tar xzf ort.tgz
+          echo "ORT_DIR=$PWD/${ORT_NAME}" >> "$GITHUB_ENV"
+          ls "${ORT_NAME}/lib"
+
+      - name: Configure and build (ML off)
+        run: |
+          set -euo pipefail
+          mkdir -p build/noml && cd build/noml
+          cmake ../../source -DCMAKE_BUILD_TYPE=Release > cfg.log
+          make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee build.log
+          if grep -iE "mlctu|mlutil|onnx" build.log; then echo "::error::ML code compiled in non-ML build"; exit 1; fi
+          ./x265 --version
+
+      - name: Configure and build (ML on)
+        run: |
+          set -euo pipefail
+          OMP_ARGS=()
+          if [[ "${{ matrix.omp }}" == libomp ]]; then
+            P="$(brew --prefix libomp)"
+            OMP_ARGS=(
+              "-DOpenMP_C_FLAGS=-Xpreprocessor -fopenmp -I$P/include"
+              "-DOpenMP_CXX_FLAGS=-Xpreprocessor -fopenmp -I$P/include"
+              -DOpenMP_C_LIB_NAMES=omp
+              -DOpenMP_CXX_LIB_NAMES=omp
+              "-DOpenMP_omp_LIBRARY=$P/lib/libomp.dylib"
+            )
+          fi
+          mkdir -p build/ml && cd build/ml
+          cmake ../../source -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_MLCTUPRED=ON -DONNXRUNTIME_DIR="$ORT_DIR" \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            "${OMP_ARGS[@]}" 2>&1 | tee cfg.log
+          grep -E "ML CTU|Library:|OpenMP" cfg.log || true
+          make -j"$(sysctl -n hw.logicalcpu)" 2>&1 | tee build.log
+          echo "=== Warnings in ML sources ==="
+          grep -E "(mlctu|mlutil|analysis|frameencoder)\.(cpp|h).*warning" build.log || echo "none"
+          ./x265 --version
+
+      - name: Inspect linkage
+        run: |
+          cd build/ml
+          echo "=== x265 ===";         otool -L x265
+          echo "=== libx265 ===";      otool -L libx265.dylib; otool -D libx265.dylib
+          echo "=== rpaths (x265) ==="; otool -l x265 | grep -A2 LC_RPATH || true
+          ls models
+
+      # First 60 frames of xiph crowd_run_1080p50: 36-byte header + 60 x (6 + 1920*1080*3/2)
+      - name: Fetch test clip
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 -r 0-186624395 -o clip.y4m \
+            https://media.xiph.org/video/derf/y4m/crowd_run_1080p50.y4m
+          test "$(stat -f %z clip.y4m)" -eq 186624396
+          head -c 36 clip.y4m
+
+      - name: Encode matrix
+        run: |
+          set -euo pipefail
+          IN="$GITHUB_WORKSPACE/clip.y4m"
+          enc() {
+            local label="$1"; shift
+            local out
+            out="$("$@" --input "$IN" --frames 60 --keyint 1 --crf 28 --psnr --log-level debug -o /dev/null 2>&1 | tr '\r' '\n')"
+            echo "$out" | grep -E "ML CTU|error|warning" || true
+            local line; line="$(echo "$out" | grep -E '^encoded')"
+            echo "$line"
+            echo "| $label | ${line#encoded } |" >> "$GITHUB_STEP_SUMMARY"
+          }
+          echo "### ${{ matrix.runner }} (${{ matrix.omp }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Mode | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          enc "noml build"                build/noml/x265
+          enc "ML off"                    build/ml/x265 --no-ml-ctu-pred
+          enc "--ml-ctu-pred"             build/ml/x265 --ml-ctu-pred
+          enc "--ml-ctu-pred --intra-64x64" build/ml/x265 --ml-ctu-pred --intra-64x64
+          echo "=== noml build with --ml-ctu-pred ==="
+          build/noml/x265 --input "$IN" --frames 1 --ml-ctu-pred -o /dev/null 2>&1 | tr '\r' '\n' | grep -i "ml-ctu-pred"
+
+      - name: Model path lookup
+        run: |
+          set -uo pipefail
+          IN="$GITHUB_WORKSPACE/clip.y4m"
+          W="$GITHUB_WORKSPACE"
+          FAIL=0
+          # expect: substring that must appear in the log
+          check() {
+            local label="$1" expect="$2"; shift 2
+            local out
+            out="$("$@" --input "$IN" --frames 2 --keyint 1 --ml-ctu-pred --log-level debug -o /dev/null 2>&1 | tr '\r' '\n')"
+            echo "== $label"
+            echo "$out" | grep -E "models from|ML CTU pred: model|init failed|error|Library not loaded|^encoded" || true
+            if ! echo "$out" | grep -qF -- "$expect"; then echo "::error::$label: expected '$expect'"; FAIL=1; fi
+          }
+          check "build tree"   "models from $W/build/ml/models"  build/ml/x265
+          check "--ml-model-dir" "models from $W/source/models" build/ml/x265 --ml-model-dir "$W/source/models"
+          X265_ML_MODEL_DIR="$W/source/models" check "env var" "models from $W/source/models" build/ml/x265
+          check "bogus dir"    "not found in /nope"               build/ml/x265 --ml-model-dir /nope
+
+          (cd build/ml && make install > /dev/null)
+          echo "=== installed x265 ==="; otool -L "$W/install/bin/x265"
+          # libx265 has no install rpath (same as upstream), so point dyld at the prefix
+          cd /tmp
+          DYLD_LIBRARY_PATH="$W/install/lib" check "install tree" "models from" "$W/install/bin/x265"
+          cp -R "$W/install" "$W/reloc" && mv "$W/install" "$W/install.off"
+          DYLD_LIBRARY_PATH="$W/reloc/lib" check "relocated install" "models from $W/reloc/" "$W/reloc/bin/x265"
+          ln -sf "$W/reloc/bin/x265" /tmp/x265-link
+          DYLD_LIBRARY_PATH="$W/reloc/lib" check "symlink to exe" "models from $W/reloc/" /tmp/x265-link
+          exit $FAIL
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.runner }}-${{ matrix.omp }}
+          path: |
+            build/*/cfg.log
+            build/*/build.log
+          retention-days: 3
